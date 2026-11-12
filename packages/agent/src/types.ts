@@ -131,6 +131,24 @@ export interface AfterToolCallContext {
 	context: AgentContext;
 }
 
+/** Context passed to `wrapToolExecution`. */
+export interface WrapToolExecutionContext {
+	/** The assistant message that requested the tool call. */
+	assistantMessage: AssistantMessage;
+	/** The raw tool call block from `assistantMessage.content`. */
+	toolCall: AgentToolCall;
+	/** Validated tool arguments, after `beforeToolCall` allowed the call. */
+	args: unknown;
+	/** Current agent context at the time the tool call executes. */
+	context: AgentContext;
+}
+
+/**
+ * Runs the tool's `execute` with `args`. Resolves to the tool's result; rejects when the tool throws.
+ * Call it at most once: a second call rejects without running the tool again.
+ */
+export type ExecuteToolFn = (args: unknown) => Promise<AgentToolResult<any>>;
+
 /** Context passed to completed-turn callbacks. */
 export interface AgentTurnContext {
 	/** The assistant message that completed the turn. */
@@ -339,6 +357,21 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	 * The hook receives the agent abort signal and is responsible for honoring it.
 	 */
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+
+	/**
+	 * Called in place of the tool's `execute`, after `beforeToolCall` allowed the call and immediately
+	 * before the tool would run. It decides whether and with which arguments the tool runs: call
+	 * `execute(args)` at most once and return its result, or return a result of its own without calling
+	 * it. A throw becomes an error result, like a throwing tool. Applies to every executed call, nested
+	 * calls made through {@link runToolCall} included.
+	 *
+	 * The hook receives the agent abort signal and is responsible for honoring it.
+	 */
+	wrapToolExecution?: (
+		context: WrapToolExecutionContext,
+		execute: ExecuteToolFn,
+		signal?: AbortSignal,
+	) => Promise<AgentToolResult<any>>;
 }
 
 /**

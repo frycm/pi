@@ -25,12 +25,15 @@ import {
 	type AgentState,
 	type AgentTool,
 	type AgentToolCallOutcome,
+	type AgentToolResult,
 	type BeforeToolCallContext,
 	type BeforeToolCallResult,
+	type ExecuteToolFn,
 	type PrepareNextTurnContext,
 	runToolCall,
 	type StreamFn,
 	type ThinkingLevel,
+	type WrapToolExecutionContext,
 } from "@earendil-works/pi-agent-core";
 import { contentText, getCurrentSystemMessage, getCurrentTools, retryDelayMs } from "@earendil-works/pi-ai";
 import type {
@@ -713,6 +716,28 @@ export class AgentSession {
 	private _installAgentToolHooks(): void {
 		this.agent.beforeToolCall = (context) => this._beforeToolCall(context);
 		this.agent.afterToolCall = (context) => this._afterToolCall(context);
+		this.agent.wrapToolExecution = (context, execute) => this._wrapToolExecution(context, execute);
+	}
+
+	/** Execution wrappers (`pi.wrapToolExecution()`). `parentToolCallId` is set for calls another tool made. */
+	private async _wrapToolExecution(
+		{ toolCall, args }: WrapToolExecutionContext,
+		execute: ExecuteToolFn,
+		parentToolCallId?: string,
+	): Promise<AgentToolResult<any>> {
+		const runner = this._extensionRunner;
+		if (!runner.hasToolExecutionWrappers()) return execute(args);
+		const sourceInfo = this._toolDefinitions.get(toolCall.name)?.sourceInfo;
+		return runner.runToolExecution(
+			{
+				toolName: toolCall.name,
+				toolCallId: toolCall.id,
+				...(parentToolCallId ? { parentToolCallId } : {}),
+				...(sourceInfo ? { sourceInfo } : {}),
+			},
+			args,
+			execute,
+		);
 	}
 
 	/** `tool_call` handlers. `parentToolCallId` is set for calls another tool made. */
@@ -812,6 +837,7 @@ export class AgentSession {
 					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
 					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
 					afterToolCall: (context) => this._afterToolCall(context, parentId),
+					wrapToolExecution: (context, execute) => this._wrapToolExecution(context, execute, parentId),
 					signal,
 					onUpdate,
 				});

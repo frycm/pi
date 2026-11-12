@@ -36,6 +36,7 @@ import type {
 	ProviderConfig,
 	RegisteredCommand,
 	ToolDefinition,
+	ToolExecutionWrapper,
 	ToolRendererResolver,
 } from "./types.ts";
 
@@ -292,6 +293,20 @@ function createExtensionAPI(
 				if (handlerIndex === -1) return;
 				handlers.splice(handlerIndex, 1);
 				if (handlers.length === 0) extension.handlers.delete(event);
+			};
+		},
+
+		wrapToolExecution(wrapper: ToolExecutionWrapper): () => void {
+			assertActive();
+			if (typeof wrapper !== "function") {
+				throw new Error(`pi.wrapToolExecution() in extension "${extension.path}" needs a function.`);
+			}
+			const registered: ToolExecutionWrapper = (call, next, ctx) => wrapper(call, next, ctx);
+			extension.toolExecutionWrappers ??= [];
+			extension.toolExecutionWrappers.push(registered);
+			return () => {
+				const index = extension.toolExecutionWrappers?.indexOf(registered) ?? -1;
+				if (index !== -1) extension.toolExecutionWrappers?.splice(index, 1);
 			};
 		},
 

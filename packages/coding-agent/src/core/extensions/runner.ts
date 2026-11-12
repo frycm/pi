@@ -2,7 +2,7 @@
  * Extension runner - executes extensions and manages their lifecycle.
  */
 
-import type { AgentMessage, AgentTool } from "@earendil-works/pi-agent-core";
+import type { AgentMessage, AgentTool, AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
 	getCurrentSystemMessage,
 	type ImageContent,
@@ -84,6 +84,8 @@ import type {
 	SessionShutdownEvent,
 	ToolCallEvent,
 	ToolCallEventResult,
+	ToolExecutionCall,
+	ToolExecutionWrapper,
 	ToolRenderers,
 	ToolResultEvent,
 	ToolResultEventResult,
@@ -271,6 +273,15 @@ export async function emitSessionShutdownEvent(
 		return true;
 	}
 	return false;
+}
+
+/** Freeze a structured-clone result and everything it contains. */
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object" && !Object.isFrozen(value)) {
+		Object.freeze(value);
+		for (const key of Reflect.ownKeys(value)) deepFreeze((value as Record<PropertyKey, unknown>)[key]);
+	}
+	return value;
 }
 
 function snapshotEventHandlers(extensions: Extension[], event: ExtensionEvent["type"]) {
@@ -1271,6 +1282,48 @@ export class ExtensionRunner {
 		}
 
 		return result;
+	}
+
+	/** Whether any extension registered a tool execution wrapper. */
+	hasToolExecutionWrappers(): boolean {
+		return this.extensions.some((ext) => (ext.toolExecutionWrappers?.length ?? 0) > 0);
+	}
+
+	/**
+	 * Run one tool execution through every registered wrapper, outermost first, and then `execute`.
+	 * The arguments are copied and deep-frozen first; every wrapper and the tool see that one object.
+	 * A wrapper that throws, or resolves to something other than a tool result, fails the call.
+	 */
+	async runToolExecution(
+		call: Omit<ToolExecutionCall, "input">,
+		args: unknown,
+		execute: (args: unknown) => Promise<AgentToolResult<any>>,
+	): Promise<AgentToolResult<any>> {
+		const chain: { path: string; wrapper: ToolExecutionWrapper }[] = [];
+		for (const ext of this.extensions) {
+			for (const wrapper of ext.toolExecutionWrappers ?? []) chain.push({ path: ext.path, wrapper });
+		}
+		if (chain.length === 0) return execute(args);
+
+		const input = deepFreeze(structuredClone(args)) as Readonly<Record<string, unknown>>;
+		const event: ToolExecutionCall = Object.freeze({ ...call, input });
+		const ctx = this.createContext();
+		const run = async (index: number): Promise<AgentToolResult<any>> => {
+			const link = chain[index];
+			if (!link) return execute(input);
+			let called = false;
+			const next = () => {
+				if (called) return Promise.reject(new Error(`Tool ${call.toolName}: next() was already called`));
+				called = true;
+				return run(index + 1);
+			};
+			const result = await link.wrapper(event, next, ctx);
+			if (!result || typeof result !== "object") {
+				throw new Error(`Tool ${call.toolName}: the execution wrapper of "${link.path}" returned no tool result`);
+			}
+			return result;
+		};
+		return run(0);
 	}
 
 	async emitUserBash(event: UserBashEvent): Promise<UserBashEventResult | undefined> {
