@@ -565,7 +565,14 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				currentContext,
+				assistantMessage,
+				preparation,
+				config,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+			);
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -636,7 +643,14 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
-			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
+			const executed = await executePreparedToolCall(
+				currentContext,
+				assistantMessage,
+				preparation,
+				config,
+				signal,
+				emitToolExecutionUpdate(toolCall, emit),
+			);
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
 				assistantMessage,
@@ -691,7 +705,7 @@ type ExecutedToolCallOutcome = {
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
 /** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
-export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">;
+export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall" | "wrapToolExecution">;
 
 type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | void;
 
@@ -824,12 +838,22 @@ export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallO
 	if (preparation.kind === "immediate") {
 		return { toolCall, result: preparation.result, isError: preparation.isError };
 	}
-	const executed = await executePreparedToolCall(preparation, signal, options.onUpdate ?? (() => {}));
+	const executed = await executePreparedToolCall(
+		context,
+		assistantMessage,
+		preparation,
+		options,
+		signal,
+		options.onUpdate ?? (() => {}),
+	);
 	return finalizeExecutedToolCall(context, assistantMessage, preparation, executed, options, signal);
 }
 
 async function executePreparedToolCall(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
 	prepared: PreparedToolCall,
+	config: ToolCallHooks,
 	signal: AbortSignal | undefined,
 	onUpdate: ToolUpdateSink,
 ): Promise<ExecutedToolCallOutcome> {
@@ -837,17 +861,28 @@ async function executePreparedToolCall(
 	let acceptingUpdates = true;
 	const startedAt = performance.now();
 	const elapsed = () => Math.round(performance.now() - startedAt);
+	const execute = (args: unknown) =>
+		prepared.tool.execute(prepared.toolCall.id, args as never, signal, (partialResult) => {
+			if (!acceptingUpdates) return;
+			updateEvents.push(Promise.resolve(onUpdate(partialResult)));
+		});
 
 	try {
-		const result = await prepared.tool.execute(
-			prepared.toolCall.id,
-			prepared.args as never,
-			signal,
-			(partialResult) => {
-				if (!acceptingUpdates) return;
-				updateEvents.push(Promise.resolve(onUpdate(partialResult)));
-			},
-		);
+		let result: AgentToolResult<any>;
+		if (config.wrapToolExecution) {
+			let executed = false;
+			result = await config.wrapToolExecution(
+				{ assistantMessage, toolCall: prepared.toolCall, args: prepared.args, context: currentContext },
+				(args) => {
+					if (executed) return Promise.reject(new Error(`Tool ${prepared.toolCall.name} was already executed`));
+					executed = true;
+					return execute(args);
+				},
+				signal,
+			);
+		} else {
+			result = await execute(prepared.args);
+		}
 		const durationMs = elapsed();
 		acceptingUpdates = false;
 		await Promise.all(updateEvents);

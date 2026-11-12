@@ -1483,6 +1483,39 @@ export interface ToolCallEventResult {
 	terminate?: boolean;
 }
 
+/**
+ * One tool execution, as a {@link ToolExecutionWrapper} sees it. Every `tool_call` handler has
+ * allowed the call by then, and the arguments can no longer change.
+ */
+export interface ToolExecutionCall {
+	toolName: string;
+	/** As in `tool_call`: `<parent id>/<n>` for calls another tool made. */
+	toolCallId: string;
+	/** Set when another tool (for example a codemode script) issued this call. */
+	parentToolCallId?: string;
+	/**
+	 * The arguments the tool runs with: a deep-frozen copy taken after the `tool_call` handlers, and
+	 * the same object the tool's `execute` receives.
+	 */
+	input: Readonly<Record<string, unknown>>;
+	/** Where the tool was registered. Undefined when pi has no record of the tool. */
+	sourceInfo?: SourceInfo;
+}
+
+/** Runs the rest of the wrapper chain and then the tool. Callable once; a second call rejects. */
+export type ToolExecutionNext = () => Promise<AgentToolResult<unknown>>;
+
+/**
+ * Decides whether a tool runs, at the moment it would run. Call `next()` to run it, or return a
+ * result of your own without calling `next()`. A throw refuses the call: its message becomes the
+ * tool's error result. See {@link ExtensionAPI.wrapToolExecution}.
+ */
+export type ToolExecutionWrapper = (
+	call: ToolExecutionCall,
+	next: ToolExecutionNext,
+	ctx: ExtensionContext,
+) => Promise<AgentToolResult<unknown>> | AgentToolResult<unknown>;
+
 /** Result from user_bash event handler */
 export type UserBashEventResult =
 	| {
@@ -1717,6 +1750,20 @@ export interface ExtensionAPI {
 	registerTool<TParams extends TSchema = TSchema, TDetails = unknown, TState = any>(
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
+
+	/**
+	 * Wrap the execution of every tool: built-in, extension, SDK and MCP tools, and calls other tools
+	 * make. A wrapper runs after every `tool_call` handler allowed the call, immediately before the
+	 * tool would run, and decides whether it runs. It sees the arguments the tool receives, deep-frozen,
+	 * so neither a wrapper nor a `tool_call` handler holding the event can change them afterwards.
+	 *
+	 * Wrappers run in extension load order, then in registration order; the first is outermost.
+	 * A wrapper gives a reliable decision point, not isolation: the tool still runs in pi's process
+	 * with pi's privileges. With at least one wrapper registered, tools receive frozen arguments.
+	 *
+	 * Returns a function that removes the wrapper.
+	 */
+	wrapToolExecution(wrapper: ToolExecutionWrapper): () => void;
 
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
@@ -2322,6 +2369,8 @@ export interface Extension {
 	replaceable?: boolean;
 	sourceInfo: SourceInfo;
 	handlers: Map<string, HandlerFn[]>;
+	/** Registered with `pi.wrapToolExecution()`, in registration order. */
+	toolExecutionWrappers?: ToolExecutionWrapper[];
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	toolRenderers?: ToolRendererResolver[];

@@ -362,9 +362,10 @@ A tool call that executes runs these hooks in order:
 
 1. `tool_execution_start`
 2. `tool_call` (can block or mutate input)
-3. `tool_execution_update` while the tool executes
-4. `tool_result` (can modify the result)
-5. `tool_execution_end`
+3. execution wrappers from [`pi.wrapToolExecution()`](#piwraptoolexecutionwrapper) (can refuse at the moment the tool would run)
+4. `tool_execution_update` while the tool executes
+5. `tool_result` (can modify the result)
+6. `tool_execution_end`
 
 Calls that do not execute end early. An unknown tool or invalid arguments skip `tool_call`; a blocked or aborted call skips execution and `tool_result`. Each of these still gets `tool_execution_end` with an error result, so use `tool_execution_end` to observe every finalized call.
 
@@ -1623,6 +1624,32 @@ pi.registerTool({
   renderResult(result, options, theme, context) { ... },
 });
 ```
+
+### pi.wrapToolExecution(wrapper)
+
+Wrap the execution of every tool: built-in, extension, SDK and MCP tools, and the calls tools make through `ctx.executeTool()`. A wrapper runs after every `tool_call` handler allowed the call, immediately before the tool would run, and decides whether it runs. Returns a function that removes the wrapper.
+
+Use it when a decision must hold at execution time, not only at `tool_call` time. In the default parallel mode every call of a batch passes `tool_call` before any of them executes, so a condition that changes while the batch runs (a policy that tripped, a session that was reset) can only be checked here.
+
+```typescript
+pi.wrapToolExecution(async (call, next, ctx) => {
+  // call.toolName, call.toolCallId, call.parentToolCallId, call.sourceInfo
+  // call.input: the arguments the tool runs with, deep-frozen
+  if (!stillAllowed(call)) throw new Error("Refused at execution");
+  return next();
+});
+```
+
+Behavior guarantees:
+- `call.input` is a deep-frozen copy of the arguments taken after the `tool_call` handlers, and it is the object the tool's `execute` receives. Neither a wrapper nor a `tool_call` handler that kept a reference to `event.input` can change what runs.
+- Wrappers run in extension load order, then registration order; the first registered is outermost.
+- `next()` runs the rest of the chain and then the tool, once. A second call rejects.
+- Returning a result without calling `next()` replaces the tool's result; the tool does not run.
+- A throw refuses the call: its message becomes the tool's error result. A wrapper that resolves to anything but a tool result fails the call the same way.
+- A call that a `tool_call` handler blocked never reaches the wrappers.
+- With at least one wrapper registered, tools receive frozen arguments; a tool that mutates its own arguments fails. Without wrappers nothing changes.
+
+A wrapper is a decision point, not isolation: the tool still runs in pi's process with pi's privileges.
 
 ### pi.sendMessage(message, options?)
 

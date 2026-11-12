@@ -586,6 +586,62 @@ describe("agentLoop with AgentMessage", () => {
 		expect(executed).toEqual([123]);
 	});
 
+	it("should run wrapToolExecution for every call of a parallel batch, after the whole batch is prepared", async () => {
+		const toolSchema = obj({ value: str() });
+		const order: string[] = [];
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "echo",
+			label: "Echo",
+			description: "Echo tool",
+			parameters: toolSchema,
+			async execute(toolCallId, params) {
+				order.push(`execute ${toolCallId}`);
+				return { content: [{ type: "text", text: params.value }], details: {} };
+			},
+		};
+		const context: AgentContext = { messages: [], tools: [tool] };
+		const config: AgentLoopConfig = {
+			model: createModel(),
+			convertToLlm: identityConverter,
+			beforeToolCall: async ({ toolCall }) => {
+				order.push(`before ${toolCall.id}`);
+				return undefined;
+			},
+			wrapToolExecution: async ({ toolCall, args }, execute) => {
+				order.push(`wrap ${toolCall.id}`);
+				if (toolCall.id === "tool-2") return { content: [{ type: "text", text: "refused" }], details: {} };
+				return execute(args);
+			},
+		};
+		let callIndex = 0;
+		const streamFn = () => {
+			const stream = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				const message =
+					callIndex === 0
+						? createAssistantMessage(
+								[
+									{ type: "toolCall", id: "tool-1", name: "echo", arguments: { value: "a" } },
+									{ type: "toolCall", id: "tool-2", name: "echo", arguments: { value: "b" } },
+								],
+								"toolUse",
+							)
+						: createAssistantMessage([{ type: "text", text: "done" }]);
+				stream.push({ type: "done", reason: callIndex === 0 ? "toolUse" : "stop", message });
+				callIndex++;
+			});
+			return stream;
+		};
+		const stream = agentLoop([createUserMessage("go")], context, config, undefined, streamFn);
+		for await (const _event of stream) {
+			// consume
+		}
+		expect(order.slice(0, 2)).toEqual(["before tool-1", "before tool-2"]);
+		expect(order).toContain("execute tool-1");
+		expect(order).not.toContain("execute tool-2");
+		expect(order.filter((entry) => entry.startsWith("wrap"))).toEqual(["wrap tool-1", "wrap tool-2"]);
+	});
+
 	it("should prepare tool arguments for validation", async () => {
 		const replaceSchema = obj({ oldText: str(), newText: str() });
 		const toolSchema = obj({ edits: arr(replaceSchema) });
@@ -2230,5 +2286,114 @@ describe("runToolCall", () => {
 			seen.push(outcome.result.structuredContent);
 		}
 		expect(seen).toEqual([undefined, { value: "replaced" }, { value: "both" }, { value: "original" }]);
+	});
+
+	describe("wrapToolExecution", () => {
+		it("runs after beforeToolCall and before afterToolCall, with the arguments execute receives", async () => {
+			const order: string[] = [];
+			const executed: unknown[] = [];
+			const tool: AgentTool<typeof echoSchema> = {
+				...echo,
+				async execute(_id, params) {
+					order.push("execute");
+					executed.push(params);
+					return { content: [{ type: "text", text: params.value }], details: {} };
+				},
+			};
+			const outcome = await runToolCall(call("w", "echo", { value: "v" }), {
+				tools: [tool],
+				assistantMessage,
+				context: { messages: [] },
+				beforeToolCall: async () => {
+					order.push("before");
+					return undefined;
+				},
+				wrapToolExecution: async ({ toolCall, args }, execute) => {
+					order.push(`wrap ${toolCall.id}`);
+					const result = await execute(args);
+					order.push("wrap done");
+					return result;
+				},
+				afterToolCall: async () => {
+					order.push("after");
+					return undefined;
+				},
+			});
+			expect(order).toEqual(["before", "wrap w", "execute", "wrap done", "after"]);
+			expect(executed).toEqual([{ value: "v" }]);
+			expect(outcome).toMatchObject({ result: { content: [{ type: "text", text: "v" }] }, isError: false });
+		});
+
+		it("is never reached for a call beforeToolCall blocked", async () => {
+			let wrapped = 0;
+			const outcome = await runToolCall(call("b", "echo", { value: "v" }), {
+				tools: [echo],
+				assistantMessage,
+				context: { messages: [] },
+				beforeToolCall: async () => ({ block: true, reason: "blocked" }),
+				wrapToolExecution: async (_context, execute) => {
+					wrapped++;
+					return execute({ value: "v" });
+				},
+			});
+			expect(wrapped).toBe(0);
+			expect(outcome.isError).toBe(true);
+		});
+
+		it("can refuse without running the tool, and a throw becomes an error result", async () => {
+			let ran = 0;
+			const tool: AgentTool<typeof echoSchema> = {
+				...echo,
+				async execute(_id, params) {
+					ran++;
+					return { content: [{ type: "text", text: params.value }], details: {} };
+				},
+			};
+			const base = { tools: [tool], assistantMessage, context: { messages: [] } };
+			const refused = await runToolCall(call("r", "echo", { value: "v" }), {
+				...base,
+				wrapToolExecution: async () => ({
+					content: [{ type: "text", text: "refused" }],
+					details: {},
+					isError: true,
+				}),
+			});
+			const thrown = await runToolCall(call("t", "echo", { value: "v" }), {
+				...base,
+				wrapToolExecution: async () => {
+					throw new Error("refused by throw");
+				},
+			});
+			expect(ran).toBe(0);
+			expect(refused).toMatchObject({ result: { content: [{ type: "text", text: "refused" }] }, isError: true });
+			expect(thrown).toMatchObject({
+				result: { content: [{ type: "text", text: "refused by throw" }] },
+				isError: true,
+			});
+		});
+
+		it("runs the tool at most once", async () => {
+			let ran = 0;
+			const tool: AgentTool<typeof echoSchema> = {
+				...echo,
+				async execute(_id, params) {
+					ran++;
+					return { content: [{ type: "text", text: params.value }], details: {} };
+				},
+			};
+			let second: unknown;
+			await runToolCall(call("o", "echo", { value: "v" }), {
+				tools: [tool],
+				assistantMessage,
+				context: { messages: [] },
+				wrapToolExecution: async ({ args }, execute) => {
+					const result = await execute(args);
+					second = await execute(args).catch((error: Error) => error.message);
+					return result;
+				},
+			});
+			expect(ran).toBe(1);
+			expect(second).toBe("Tool echo was already executed");
+		});
 	});
 });
